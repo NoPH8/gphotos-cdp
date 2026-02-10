@@ -740,6 +740,11 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 			return err
 		}
 
+		// Wait for scrollable container to be ready
+		if err := waitForScrollableContainer(ctx); err != nil {
+			return fmt.Errorf("scrollable container not ready: %w", err)
+		}
+
 		// Find class name for date nodes
 		dateNodesClassName := ""
 		for range 20 {
@@ -759,6 +764,12 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 		bisectBounds := []float64{0.0, 1.0}
 		scrollPos := 0.0
 		var foundDateNode, matchedNode *cdp.Node
+		// bestLeNode tracks the best (closest) date node that is <= startDate (preferred).
+		// bestAbsNode tracks the closest date node by absolute distance (fallback).
+		var bestLeNode *cdp.Node
+		var bestLeDiffHours int
+		var bestAbsNode *cdp.Node
+		var bestAbsDiffHours int
 		for range 100 {
 			scrollTarget := (bisectBounds[0] + bisectBounds[1]) / 2
 			log.Debug().Msgf("scrolling to %.2f%%", scrollTarget*100)
@@ -826,6 +837,17 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 				}
 				diff := int(dt.Sub(startDate).Hours())
 				log.Trace().Msgf("parsed date element %v with distance %d days", dt, diff/24)
+
+				// Track best candidates across all iterations, so -to doesn't require an exact date header to exist.
+				if diff <= 0 && (bestLeNode == nil || diff > bestLeDiffHours) {
+					bestLeNode = n
+					bestLeDiffHours = diff
+				}
+				if bestAbsNode == nil || absInt(diff) < absInt(bestAbsDiffHours) {
+					bestAbsNode = n
+					bestAbsDiffHours = diff
+				}
+
 				if closestDateNode == nil || absInt(diff) < absInt(closestDateDiff) {
 					closestDateNode = n
 					closestDateDiff = diff
@@ -861,7 +883,17 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 		time.Sleep(1000 * time.Millisecond)
 
 		if foundDateNode == nil {
-			return errors.New("could not find -start date")
+			// If the exact -to date doesn't exist as a date header, pick the closest earlier header (preferred),
+			// otherwise the closest header we observed.
+			if bestLeNode != nil {
+				foundDateNode = bestLeNode
+			} else if matchedNode != nil {
+				foundDateNode = matchedNode
+			} else if bestAbsNode != nil {
+				foundDateNode = bestAbsNode
+			} else {
+				return errors.New("could not find any date nodes to position for -to")
+			}
 		}
 
 		for foundDateNode.Parent != nil {
@@ -1757,6 +1789,32 @@ func listenNavEvents(ctx context.Context) {
 	})
 }
 
+func waitForScrollableContainer(ctx context.Context) error {
+	var mainSel string
+	if len(*albumIdFlag) > 1 {
+		mainSel = `c-wiz c-wiz c-wiz`
+	} else {
+		mainSel = `[role="main"]`
+	}
+
+	for range 10 {
+		var found bool
+		if err := chromedp.Evaluate(fmt.Sprintf(`
+			(function() {
+				var main = [...document.querySelectorAll('%s')].filter(x => x.querySelector('a[href*="/photo/"]') && getComputedStyle(x).visibility != 'hidden')[0];
+				return !!main;
+			})();
+		`, mainSel), &found).Do(ctx); err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for scrollable container")
+}
+
 func setScrollPosition(ctx context.Context, pos float64) error {
 	var mainSel string
 	if len(*albumIdFlag) > 1 {
@@ -1765,14 +1823,22 @@ func setScrollPosition(ctx context.Context, pos float64) error {
 		mainSel = `[role="main"]`
 	}
 
+	var result string
 	if err := chromedp.Evaluate(fmt.Sprintf(`
 		(function() {
 			var main = [...document.querySelectorAll('%s')].filter(x => x.querySelector('a[href*="/photo/"]') && getComputedStyle(x).visibility != 'hidden')[0];
+			if (!main) {
+				return "ERROR: Could not find scrollable container";
+			}
 			const scrollTarget = %f;
 			main.scrollTo(0, main.scrollHeight*scrollTarget);
+			return "OK";
 		})();
-	`, mainSel, pos), nil).Do(ctx); err != nil {
+	`, mainSel, pos), &result).Do(ctx); err != nil {
 		return err
+	}
+	if result != "OK" {
+		return fmt.Errorf("%s", result)
 	}
 	return nil
 }
@@ -1787,6 +1853,7 @@ func getScrollPosition(ctx context.Context, sliderPos *float64) error {
 
 	var err error
 	for range 3 {
+		success := false
 		func() {
 			ctx, cancel := context.WithTimeout(ctx, 4000*time.Millisecond)
 			defer cancel()
@@ -1795,16 +1862,30 @@ func getScrollPosition(ctx context.Context, sliderPos *float64) error {
 				defer unlock()
 				target.ActivateTarget(chromedp.FromContext(ctx).Target.TargetID).Do(ctx)
 			}
-			err = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
+			evalErr := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
 				(function() {
 					var main = [...document.querySelectorAll('%s')].filter(x => x.querySelector('a[href*="/photo/"]') && getComputedStyle(x).visibility != 'hidden')[0];
-					return main ? (main.scrollTop+0.000001)/(main.scrollHeight-main.clientHeight+0.000001) : 0.0;
-				})()`, mainSel), &sliderPos))
+					if (!main) {
+						return -1.0;
+					}
+					return (main.scrollTop+0.000001)/(main.scrollHeight-main.clientHeight+0.000001);
+				})()`, mainSel), sliderPos))
+			if evalErr != nil {
+				err = evalErr
+				return
+			}
+			if *sliderPos < 0 {
+				err = fmt.Errorf("could not find scrollable container")
+				return
+			}
+			success = true
 		}()
-		if err == nil {
+		if err == nil && success {
 			break
 		}
-		log.Warn().Err(err).Msgf("error getting scroll position")
+		if err != nil {
+			log.Warn().Err(err).Msgf("error getting scroll position")
+		}
 	}
 
 	return err
