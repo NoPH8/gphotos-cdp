@@ -740,6 +740,9 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 			return err
 		}
 
+		// Give the page time to stabilize after scrolling to the end
+		time.Sleep(1 * time.Second)
+
 		// Wait for scrollable container to be ready
 		if err := waitForScrollableContainer(ctx); err != nil {
 			return fmt.Errorf("scrollable container not ready: %w", err)
@@ -1797,8 +1800,10 @@ func waitForScrollableContainer(ctx context.Context) error {
 		mainSel = `[role="main"]`
 	}
 
-	for range 10 {
+	// Try multiple strategies: first with photos, then just the container itself
+	for range 20 {
 		var found bool
+		// Strategy 1: Look for container with photos (preferred)
 		if err := chromedp.Evaluate(fmt.Sprintf(`
 			(function() {
 				var main = [...document.querySelectorAll('%s')].filter(x => x.querySelector('a[href*="/photo/"]') && getComputedStyle(x).visibility != 'hidden')[0];
@@ -1810,7 +1815,24 @@ func waitForScrollableContainer(ctx context.Context) error {
 		if found {
 			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		
+		// Strategy 2: Look for container even without photos (fallback after scrolling to end)
+		if err := chromedp.Evaluate(fmt.Sprintf(`
+			(function() {
+				var main = [...document.querySelectorAll('%s')].filter(x => getComputedStyle(x).visibility != 'hidden' && x.scrollHeight > x.clientHeight)[0];
+				return !!main;
+			})();
+		`, mainSel), &found).Do(ctx); err != nil {
+			return err
+		}
+		if found {
+			log.Debug().Msg("found scrollable container without photos, page may still be loading")
+			// Give it a bit more time for photos to load
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		}
+		
+		time.Sleep(300 * time.Millisecond)
 	}
 	return fmt.Errorf("timeout waiting for scrollable container")
 }
@@ -1824,9 +1846,14 @@ func setScrollPosition(ctx context.Context, pos float64) error {
 	}
 
 	var result string
+	// Try with photos first (preferred)
 	if err := chromedp.Evaluate(fmt.Sprintf(`
 		(function() {
 			var main = [...document.querySelectorAll('%s')].filter(x => x.querySelector('a[href*="/photo/"]') && getComputedStyle(x).visibility != 'hidden')[0];
+			if (!main) {
+				// Fallback: try without requiring photos (for when at end of timeline)
+				main = [...document.querySelectorAll('%s')].filter(x => getComputedStyle(x).visibility != 'hidden' && x.scrollHeight > x.clientHeight)[0];
+			}
 			if (!main) {
 				return "ERROR: Could not find scrollable container";
 			}
@@ -1834,7 +1861,7 @@ func setScrollPosition(ctx context.Context, pos float64) error {
 			main.scrollTo(0, main.scrollHeight*scrollTarget);
 			return "OK";
 		})();
-	`, mainSel, pos), &result).Do(ctx); err != nil {
+	`, mainSel, mainSel, pos), &result).Do(ctx); err != nil {
 		return err
 	}
 	if result != "OK" {
@@ -1866,10 +1893,14 @@ func getScrollPosition(ctx context.Context, sliderPos *float64) error {
 				(function() {
 					var main = [...document.querySelectorAll('%s')].filter(x => x.querySelector('a[href*="/photo/"]') && getComputedStyle(x).visibility != 'hidden')[0];
 					if (!main) {
+						// Fallback: try without requiring photos (for when at end of timeline)
+						main = [...document.querySelectorAll('%s')].filter(x => getComputedStyle(x).visibility != 'hidden' && x.scrollHeight > x.clientHeight)[0];
+					}
+					if (!main) {
 						return -1.0;
 					}
 					return (main.scrollTop+0.000001)/(main.scrollHeight-main.clientHeight+0.000001);
-				})()`, mainSel), sliderPos))
+				})()`, mainSel, mainSel), sliderPos))
 			if evalErr != nil {
 				err = evalErr
 				return
