@@ -2064,6 +2064,26 @@ syncAllLoop:
 
 			log := log.With().Str("itemId", imageId).Logger()
 
+			// Check date from aria-label before processing (if date flags are set)
+			if fromDate != (time.Time{}) || toDate != (time.Time{}) {
+				ariaLabel := lastNode.AttributeValue("aria-label")
+				if ariaLabel != "" {
+					photoDate, err := parseDateFromAriaLabel(ariaLabel)
+					if err == nil {
+						if fromDate != (time.Time{}) && photoDate.Before(fromDate) {
+							log.Info().Msgf("found photo taken before -from date (%v < %v) in thumbnail, stopping sync here", photoDate.Format(time.DateOnly), fromDate.Format(time.DateOnly))
+							break syncAllLoop
+						}
+						if toDate != (time.Time{}) && photoDate.After(toDate) {
+							log.Trace().Msgf("skipping photo taken after -to date (%v > %v) in thumbnail", photoDate.Format(time.DateOnly), toDate.Format(time.DateOnly))
+							continue
+						}
+					} else {
+						log.Trace().Err(err).Msgf("could not parse date from aria-label, will check date later when navigating to photo")
+					}
+				}
+			}
+
 			shouldDownload, err := s.isNewItem(log, imageId, false)
 			if err != nil {
 				return err
@@ -2419,6 +2439,58 @@ var yearRegex = regexp.MustCompile(`\d{4}`)
 var dayRegex = regexp.MustCompile(`\d{1,2}`)
 var timeRegex = regexp.MustCompile(`(\d{1,2}):(\d\d)(?::\d\d)?.?([aApP][Mm])?$`)
 var timeZoneRegex = regexp.MustCompile(`GMT([-+])?(\d{1,2})(?::(\d\d))?`)
+// ariaLabelDateRegex matches dates in aria-label like "Photo - Landscape - Feb 12, 2025, 6:34:39 PM"
+var ariaLabelDateRegex = regexp.MustCompile(`(\w{3})\s+(\d{1,2}),\s+(\d{4})`)
+
+// parseDateFromAriaLabel extracts a date from an aria-label string like "Photo - Landscape - Feb 12, 2025, 6:34:39 PM"
+// Returns zero time and error if date cannot be parsed
+func parseDateFromAriaLabel(ariaLabel string) (time.Time, error) {
+	match := ariaLabelDateRegex.FindStringSubmatch(ariaLabel)
+	if len(match) != 4 {
+		return time.Time{}, fmt.Errorf("could not find date pattern in aria-label: %s", ariaLabel)
+	}
+	
+	monthStr := match[1]
+	dayStr := match[2]
+	yearStr := match[3]
+	
+	day, err := strconv.Atoi(dayStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("could not parse day: %w", err)
+	}
+	
+	year, err := strconv.Atoi(yearStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("could not parse year: %w", err)
+	}
+	
+	month := 0
+	for i, v := range loc.ShortMonthNames {
+		if strings.EqualFold(monthStr, v) {
+			month = i + 1
+			break
+		}
+	}
+	if month == 0 {
+		return time.Time{}, fmt.Errorf("could not find month %s in short month names", monthStr)
+	}
+	
+	// Parse time if available (format: "6:34:39 PM")
+	hour, minute := 0, 0
+	timeMatch := timeRegex.FindStringSubmatch(ariaLabel)
+	if timeMatch != nil {
+		hour, _ = strconv.Atoi(timeMatch[1])
+		minute, _ = strconv.Atoi(timeMatch[2])
+		if strings.EqualFold(timeMatch[3], "pm") && hour < 12 {
+			hour += 12
+		}
+		if strings.EqualFold(timeMatch[3], "am") && hour == 12 {
+			hour = 0
+		}
+	}
+	
+	return time.Date(year, time.Month(month), day, hour, minute, 0, 0, time.Local), nil
+}
 
 func parseDate(dateStr, timeStr, tzStr string) (time.Time, error) {
 	var year, month, day, hour, minute int
