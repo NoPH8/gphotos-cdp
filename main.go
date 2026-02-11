@@ -736,6 +736,7 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 		log.Info().Msgf("attempting to scroll to %v", startDate)
 
 		if err := s.navToEnd(ctx); err != nil {
+			log.Debug().Msgf("error navigating to end")
 			return err
 		}
 
@@ -748,12 +749,14 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 			if dateNodesClassName != "" {
 				break
 			}
+			log.Debug().Msgf("yet another attempt: %v", dateNodesClassName)
 			chromedp.KeyEvent(kb.PageUp).Do(ctx)
 			time.Sleep(100 * time.Millisecond)
 		}
 		if dateNodesClassName == "" {
 			return errors.New("failed to find date nodes class name")
 		}
+		log.Debug().Msgf("found date nodes class name: %v", dateNodesClassName)
 
 		bisectBounds := []float64{0.0, 1.0}
 		scrollPos := 0.0
