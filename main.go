@@ -762,6 +762,11 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 		scrollPos := 0.0
 		var foundDateNode, matchedNode *cdp.Node
 		for range 100 {
+			// If our search interval is extremely small, we won't make progress anymore.
+			if bisectBounds[1]-bisectBounds[0] < 0.0005 {
+				break
+			}
+
 			scrollTarget := (bisectBounds[0] + bisectBounds[1]) / 2
 			log.Debug().Msgf("scrolling to %.2f%%", scrollTarget*100)
 			for range 20 {
@@ -838,20 +843,37 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 				}
 			}
 
+			// If we already found an exact match earlier and now we're clearly away from the match,
+			// commit to the best exact match we saw.
 			if int(closestDateDiff/24) != 0 && matchedNode != nil {
 				foundDateNode = matchedNode
 				break
 			} else if int(closestDateDiff/24) == 0 && closestDateNode != nil {
+				// Exact date match.
 				if knownFirstOccurance {
 					foundDateNode = closestDateNode
 					break
-				} else {
-					matchedNode = closestDateNode
-					bisectBounds[1] = (scrollPos + bisectBounds[1]*3) / 4
 				}
+
+				// If we're basically at the end of the timeline, accept the match.
+				// (Google Photos can show only one "occurrence" because you're already at the oldest items.)
+				if scrollPos >= 0.999 {
+					foundDateNode = closestDateNode
+					break
+				}
+				// Otherwise, we matched the date but need to search "up" (earlier in the scroll)
+				// to find the first occurrence. Force the upper bound below current position so we don't get stuck at 1.0.
+				matchedNode = closestDateNode
+				newUpper := scrollPos - 0.02
+				if newUpper < bisectBounds[0] {
+					newUpper = (bisectBounds[0] + scrollPos) / 2
+				}
+				bisectBounds[1] = newUpper
 			} else if closestDateDiff > 0 {
+				// Visible date is after target date -> move down (towards end).
 				bisectBounds[0] = scrollPos
 			} else if closestDateDiff < 0 {
+				// Visible date is before target date -> move up (towards start).
 				bisectBounds[1] = scrollPos
 			}
 
@@ -863,7 +885,7 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 		time.Sleep(1000 * time.Millisecond)
 
 		if foundDateNode == nil {
-			return errors.New("could not find -start date")
+			return errors.New("could not find -to date")
 		}
 
 		for foundDateNode.Parent != nil {
