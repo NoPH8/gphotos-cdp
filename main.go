@@ -234,6 +234,7 @@ type Session struct {
 	downloadDirTmp   string // dir where the photos get stored temporarily
 	profileDir       string // user data session dir. automatically created on chrome startup.
 	startNodeParent  *cdp.Node
+	startScrollPos   float64 // scroll position chosen by firstNav when using -to
 	globalErrChan    chan error
 	userPath         string
 	albumPath        string
@@ -893,6 +894,9 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 		if foundDateNode == nil {
 			return errors.New("could not find -to date")
 		}
+
+		// Persist the position we navigated to, so resync can start from here.
+		s.startScrollPos = scrollPos
 
 		for foundDateNode.Parent != nil {
 			foundDateNode = foundDateNode.Parent
@@ -1878,6 +1882,15 @@ func (s *Session) resync(ctx context.Context) error {
 	defer cancel()
 
 	listenNavEvents(ctx)
+
+	// If firstNav selected a starting point (e.g. via -to), jump there before scanning nodes.
+	if *toFlag != "" && s.startScrollPos > 0 {
+		log.Debug().Msgf("resync: applying firstNav start scroll position: %.4f%%", s.startScrollPos*100)
+		if err := setScrollPosition(ctx, s.startScrollPos); err != nil {
+			return fmt.Errorf("resync: failed to set initial scroll position: %w", err)
+		}
+		time.Sleep(750 * time.Millisecond)
+	}
 
 	lastNode := &cdp.Node{}
 	var nodes []*cdp.Node
