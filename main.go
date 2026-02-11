@@ -761,6 +761,11 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 		bisectBounds := []float64{0.0, 1.0}
 		scrollPos := 0.0
 		var foundDateNode, matchedNode *cdp.Node
+
+		// We want the closest timeline header date that is <= startDate (-to date).
+		// So we keep the best seen candidate (largest date not after startDate) and bisect around it.
+		bestCandidateDiff := math.MinInt // diff in hours; must be <= 0, and as large as possible (closest to 0)
+
 		for range 100 {
 			// If our search interval is extremely small, we won't make progress anymore.
 			if bisectBounds[1]-bisectBounds[0] < 0.0005 {
@@ -798,14 +803,22 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 				return errors.New("no date nodes found")
 			}
 
-			var closestDateNode *cdp.Node
-			var closestDateDiff int
-			var knownFirstOccurance bool
-			for i, n := range dateNodes {
+			var bestLeNode *cdp.Node
+			bestLeDiff := math.MinInt // best diff<=0, closest to 0 (largest)
+			foundLe := false
+
+			for _, n := range dateNodes {
 				if n.NodeName != "DIV" || n.ChildNodeCount == 0 {
 					continue
 				}
 				dateStr := n.Children[0].NodeValue
+
+				// Timeline headers sometimes omit the year (e.g. "Apr 9").
+				// Assume the year we're searching for, otherwise parsing may default to the current year.
+				if yearRegex.FindString(dateStr) == "" {
+					dateStr = fmt.Sprintf("%s %04d", dateStr, startDate.Year())
+				}
+
 				var dt time.Time
 				// Handle special days like "Yesterday" and "Today"
 				today := time.Now()
@@ -831,53 +844,46 @@ func (s *Session) firstNav(ctx context.Context) (err error) {
 						return fmt.Errorf("could not parse date %s: %w", dateStr, err)
 					}
 				}
-				diff := int(dt.Sub(startDate).Hours())
+
+				diff := int(dt.Sub(startDate).Hours()) // >0 means header is after -to (too new)
 				log.Trace().Msgf("parsed date element %v with distance %d days", dt, diff/24)
-				if closestDateNode == nil || absInt(diff) < absInt(closestDateDiff) {
-					closestDateNode = n
-					closestDateDiff = diff
-					knownFirstOccurance = i > 0 || scrollPos <= 0.001
-					if knownFirstOccurance {
-						break
+
+				if diff <= 0 {
+					foundLe = true
+					if bestLeNode == nil || diff > bestLeDiff {
+						bestLeNode = n
+						bestLeDiff = diff
 					}
 				}
 			}
 
-			// If we already found an exact match earlier and now we're clearly away from the match,
-			// commit to the best exact match we saw.
-			if int(closestDateDiff/24) != 0 && matchedNode != nil {
-				foundDateNode = matchedNode
-				break
-			} else if int(closestDateDiff/24) == 0 && closestDateNode != nil {
-				// Exact date match.
-				if knownFirstOccurance {
-					foundDateNode = closestDateNode
-					break
+			if foundLe && bestLeNode != nil {
+				// We found a header date <= -to. Keep the best seen candidate overall.
+				if bestLeDiff > bestCandidateDiff {
+					bestCandidateDiff = bestLeDiff
+					matchedNode = bestLeNode
 				}
 
-				// If we're basically at the end of the timeline, accept the match.
-				// (Google Photos can show only one "occurrence" because you're already at the oldest items.)
+				// Now try to move "up" (towards newer items, smaller scroll pos) to get closer to -to,
+				// but still <= -to.
+				bisectBounds[1] = scrollPos
+
+				// If we're very close to the end, just accept what we have.
 				if scrollPos >= 0.999 {
-					foundDateNode = closestDateNode
 					break
 				}
-				// Otherwise, we matched the date but need to search "up" (earlier in the scroll)
-				// to find the first occurrence. Force the upper bound below current position so we don't get stuck at 1.0.
-				matchedNode = closestDateNode
-				newUpper := scrollPos - 0.02
-				if newUpper < bisectBounds[0] {
-					newUpper = (bisectBounds[0] + scrollPos) / 2
-				}
-				bisectBounds[1] = newUpper
-			} else if closestDateDiff > 0 {
-				// Visible date is after target date -> move down (towards end).
+			} else {
+				// All visible headers are after -to (too new), move down (towards older items).
 				bisectBounds[0] = scrollPos
-			} else if closestDateDiff < 0 {
-				// Visible date is before target date -> move up (towards start).
-				bisectBounds[1] = scrollPos
 			}
 
 			time.Sleep(50 * time.Millisecond)
+		}
+
+		// If we found any acceptable candidate (<= -to), use it.
+		if matchedNode != nil {
+			foundDateNode = matchedNode
+			log.Debug().Msgf("found date node with date str %v", matchedNode.Children[0].NodeValue)
 		}
 
 		log.Debug().Msgf("final scroll position: %.4f%%", scrollPos*100)
