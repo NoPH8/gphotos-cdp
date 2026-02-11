@@ -19,7 +19,6 @@ limitations under the License.
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -918,32 +917,53 @@ func (s *Session) setFirstItem(ctx context.Context) error {
 }
 
 // navToEnd scrolls down to the end of the page, i.e. to the oldest items.
+// by driving the main scroll container instead of relying on screenshots.
 func (s *Session) navToEnd(ctx context.Context) error {
-	// try jumping to the end of the page. detect we are there and have stopped
-	// moving when two consecutive screenshots are identical.
-	var previousScr, scr []byte
-	for {
-		if err := chromedp.Run(ctx,
-			chromedp.KeyEvent(kb.PageDown),
-			chromedp.KeyEvent(kb.End),
-			chromedp.Sleep(tick*time.Duration(5)),
-			chromedp.CaptureScreenshot(&scr),
-		); err != nil {
-			return err
+	log.Debug().Msg("scrolling to end using scroll position")
+
+	// We consider ourselves "at the end" once the scroll position is very
+	// close to 1.0 and stable for a few iterations.
+	const targetPos = 1.0
+	const posEpsilon = 0.001
+
+	var prevPos float64 = -1.0
+	stableCount := 0
+
+	for i := 0; i < 200; i++ {
+		// Try to jump near the end.
+		if err := setScrollPosition(ctx, targetPos); err != nil {
+			return fmt.Errorf("navToEnd: failed to set scroll position: %w", err)
 		}
-		if previousScr == nil {
-			previousScr = scr
-			continue
+
+		time.Sleep(500 * time.Millisecond)
+
+		var curPos float64
+		if err := getScrollPosition(ctx, &curPos); err != nil {
+			return fmt.Errorf("navToEnd: failed to get scroll position: %w", err)
 		}
-		if bytes.Equal(previousScr, scr) {
-			break
+
+		log.Trace().Msgf("navToEnd: current scroll position %.4f", curPos)
+
+		// If we're very close to the end and the position isn't changing
+		// anymore, assume we've reached the oldest items.
+		if math.Abs(curPos-targetPos) < posEpsilon {
+			if prevPos >= 0 && math.Abs(curPos-prevPos) < posEpsilon {
+				stableCount++
+				if stableCount >= 3 {
+					log.Debug().Msg("successfully jumped to the end")
+					return nil
+				}
+			} else {
+				stableCount = 1
+			}
+		} else {
+			stableCount = 0
 		}
-		previousScr = scr
+
+		prevPos = curPos
 	}
 
-	log.Debug().Msg("successfully jumped to the end")
-
-	return nil
+	return fmt.Errorf("navToEnd: gave up after too many attempts scrolling to end")
 }
 
 // doRun runs *runFlag as a command on the given filePath.
