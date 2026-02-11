@@ -1791,6 +1791,10 @@ func setScrollPosition(ctx context.Context, pos float64) error {
 	if err := chromedp.Evaluate(fmt.Sprintf(`
 		(function() {
 			var main = [...document.querySelectorAll('%s')].filter(x => x.querySelector('a[href*="/photo/"]') && getComputedStyle(x).visibility != 'hidden')[0];
+			if (!main) {
+				// No suitable scroll container found; safely do nothing.
+				return;
+			}
 			const scrollTarget = %f;
 			main.scrollTo(0, main.scrollHeight*scrollTarget);
 		})();
