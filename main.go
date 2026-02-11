@@ -1312,13 +1312,15 @@ func (s *Session) getPhotoData(ctx context.Context, log zerolog.Logger, imageId 
 }
 
 // startDownload starts the download of the currently viewed item. It returns
-// with an error if the download does not start within a minute.
+// with an error if the download does not start within a reasonable timeout.
 func (s *Session) startDownload(ctx context.Context, log zerolog.Logger, imageId string, isOriginal bool, hasOriginal *bool, downloadChan <-chan NewDownload) (newDownload NewDownload, progressChan <-chan bool, err error) {
 	log.Trace().Msgf("entering startDownload()")
 
 	start := time.Now()
 
-	timeoutTimer := time.NewTimer(120 * time.Second)
+	// Some large videos can take a while before Chrome emits a
+	// DownloadWillBegin event; 3 minutes should be enough in practice.
+	timeoutTimer := time.NewTimer(3 * time.Minute)
 	refreshTimer := time.NewTimer(120 * time.Second)
 	requestTimer := time.NewTimer(0 * time.Second)
 
