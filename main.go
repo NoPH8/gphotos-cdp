@@ -76,6 +76,7 @@ var (
 	workersFlag     = flag.Int64("workers", 1, "number of concurrent downloads allowed")
 	albumIdFlag     = flag.String("album", "", "ID of album to download, has no effect if lastdone file is found or if -start contains full URL")
 	albumTypeFlag   = flag.String("albumtype", "album", "type of album to download (as seen in URL), has no effect if lastdone file is found or if -start contains full URL")
+	listAlbumsFlag  = flag.Bool("listalbums", false, "find album IDs, don't download anything")
 	batchSizeFlag   = flag.Int("batchsize", 0, "number of photos to download in one batch")
 	execPathFlag    = flag.String("execpath", "", "path to Chrome/Chromium binary to use")
 )
@@ -189,6 +190,11 @@ func main() {
 		loc = _loc
 	}
 
+	if *listAlbumsFlag {
+		listAlbums(s, startupCtx, ctx, startupCancel)
+		return
+	}
+
 	if err := chromedp.Run(startupCtx,
 		chromedp.ActionFunc(s.firstNav),
 	); err != nil {
@@ -232,6 +238,7 @@ type Session struct {
 	globalErrChan    chan error
 	userPath         string
 	albumPath        string
+	symlinkDir       string // stored images will also be symlinked into this directory if set
 	existingItems    sync.Map
 	foundItems       sync.Map
 	downloadedItems  sync.Map
@@ -240,6 +247,7 @@ type Session struct {
 }
 
 func NewSession() (*Session, error) {
+	symlinkDir := ""
 	albumPath := ""
 	userPath := ""
 	if *albumIdFlag != "" {
@@ -308,6 +316,7 @@ func NewSession() (*Session, error) {
 		globalErrChan:   make(chan error, 1),
 		userPath:        userPath,
 		albumPath:       albumPath,
+		symlinkDir:      symlinkDir,
 		newDownloadChan: make(chan NewDownload),
 	}
 
@@ -596,6 +605,107 @@ func captureScreenshot(ctx context.Context, filePath string) {
 	} else if err := os.WriteFile(filePath+".html", []byte(html), 0640); err != nil {
 		log.Err(err).Msgf("failed to write HTML: %v", err)
 	}
+}
+
+// print out all album IDs
+func listAlbums(s *Session, startupCtx context.Context, ctx context.Context, startupCancel context.CancelFunc) {
+	if err := chromedp.Run(startupCtx,
+		chromedp.ActionFunc(s.navigateToAlbums),
+	); err != nil {
+		log.Fatal().Msgf("failed to load albums page: %v", err)
+	}
+	startupCancel()
+
+	if err := chromedp.Run(ctx,
+		chromedp.ActionFunc(func(ctx context.Context) (err error) {
+			log.Info().Msgf("Identified albums...")
+			for {
+				albumId, err := s.findNextAlbum(ctx)
+				if err != nil {
+					return err
+				}
+				if albumId == "" {
+					break
+				}
+				log.Info().Msgf("albumId: %s", albumId)
+			}
+			log.Info().Msg("Done")
+			return nil
+		}),
+	); err != nil {
+		log.Fatal().Msgf("failed to list albums: %v", err)
+	}
+}
+
+// loads the albums page and leaves it with nothing selected
+func (s *Session) navigateToAlbums(ctx context.Context) (err error) {
+	if err := s.navigateWithAction(ctx, log.Logger, chromedp.Navigate(gphotosUrl+"/albums"), "to albums", 20000*time.Millisecond, 5); err != nil {
+		return err
+	}
+	chromedp.WaitReady("body", chromedp.ByQuery).Do(ctx)
+
+	// This is only used to ensure page is loaded
+	_, err = s.findNextAlbum(ctx)
+	if err != nil {
+		return err
+	}
+
+	var location string
+	if err := chromedp.Run(ctx,
+		chromedp.Evaluate("document.activeElement.blur()", nil),
+		chromedp.Location(&location),
+	); err != nil {
+		return err
+	}
+	log.Debug().Msgf("location: %v", location)
+
+	return nil
+}
+
+func (s *Session) findNextAlbum(ctx context.Context) (string, error) {
+	// wait for page to be loaded, i.e. that we can make an element active by using
+	// the right arrow key, or if an element was already selected, go to the next album
+	var firstItem string
+	attributes := make(map[string]string)
+
+	if err := chromedp.Run(ctx, chromedp.Attributes(`document.activeElement`, &attributes, chromedp.ByJSPath)); err == nil {
+		itemHref, ok := attributes["href"]
+		if ok {
+			firstItem = itemHref
+		}
+	}
+
+	for {
+		log.Trace().Msg("attempting to find next album")
+		if err := chromedp.Run(ctx,
+			chromedp.KeyEvent(kb.ArrowRight),
+			chromedp.Sleep(tick),
+			chromedp.Attributes(`document.activeElement`, &attributes, chromedp.ByJSPath)); err != nil {
+			return "", err
+		}
+		if len(attributes) == 0 {
+			time.Sleep(tick)
+			continue
+		}
+
+		itemHref, ok := attributes["href"]
+		if ok {
+			if itemHref == firstItem {
+				break
+			}
+
+			res, err := albumIdFromUrl(itemHref)
+			if err == nil {
+				log.Debug().Msgf("page loaded, next album in the feed is: %s", res)
+				return res, nil
+			}
+		} else {
+			break
+		}
+	}
+
+	log.Warn().Msgf("page loaded, could not find any album")
+	return "", nil
 }
 
 // firstNav does either of:
@@ -1292,6 +1402,25 @@ func imageIdFromUrl(location string) (string, error) {
 	return "", fmt.Errorf("could not find /photo/{imageId} pattern in URL: %v", location)
 }
 
+func albumIdFromUrl(location string) (string, error) {
+	// Parse the URL
+	u, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL %v: %w", location, err)
+	}
+
+	// Split the path into segments
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+
+	// Look for "album" segment and ensure there's a following segment
+	for i := 0; i < len(parts)-1; i++ {
+		if parts[i] == "album" || parts[i] == "share" || parts[i] == *albumTypeFlag {
+			return parts[i] + "/" + parts[i+1], nil
+		}
+	}
+	return "", fmt.Errorf("could not find /share|album/{albumId} pattern in URL: %v", location)
+}
+
 // makeOutDir creates a directory in s.downloadDir named of the item ID
 func (s *Session) makeOutDir(imageId string) (string, error) {
 	newDir := filepath.Join(s.downloadDir, imageId)
@@ -1383,6 +1512,23 @@ func (s *Session) processDownload(log zerolog.Logger, downloadInfo NewDownload, 
 		}
 		filePaths = []string{newFile}
 		baseNames = append(baseNames, filepath.Base(newFile))
+
+		// create symlink if configured
+		if s.symlinkDir != "" {
+			symlinkPath := filepath.Join(s.symlinkDir, imageId)
+			if _, err := os.Stat(symlinkPath); err != nil {
+				relativePath, err := filepath.Rel(s.symlinkDir, outDir)
+				if err != nil {
+					log.Error().Msgf("Error calculating relative path from %s to %s1: %v\n", s.symlinkDir, outDir, err)
+				} else {
+					if err := os.Symlink(relativePath, symlinkPath); err != nil {
+						log.Error().Msgf("Error creating symlink from %s to %s1: %v\n", symlinkPath, outDir, err)
+					} else {
+						log.Debug().Msgf("Created symlink %s", symlinkPath)
+					}
+				}
+			}
+		}
 	}
 
 	if err := doFileDateUpdate(data.date, filePaths); err != nil {
@@ -1695,8 +1841,31 @@ func (s *Session) resync(ctx context.Context) error {
 		return fmt.Errorf("error finding photo nodes, %w", err)
 	}
 	if len(nodes) == 0 {
+		log.Debug().Msgf("Could not find any DOM nodes matching '%s'", photoNodeSelector)
 		log.Info().Msg("no photos to sync")
 		return nil
+	}
+
+	// if downloading an album, attempt to get album name for symlinking
+	if s.albumPath != "" {
+		title := ""
+		if chromedp.Title(&title).Do(ctx) == nil && len(title) > 0 {
+			lastDashIndex := strings.LastIndex(title, " - ")
+			if lastDashIndex == -1 {
+				log.Warn().Msgf("Could not identify album name from page title '%s'", title)
+			} else {
+				albumName := title[:lastDashIndex]
+				albumDir := filepath.Join(s.downloadDir, "albums", albumName+"_"+*albumIdFlag)
+				if err := os.MkdirAll(albumDir, 0700); err != nil {
+					log.Error().Msgf("Could not create album directory '%s'. %s", albumDir, err.Error())
+				} else {
+					s.symlinkDir = albumDir
+					log.Info().Msgf("Symlinking downloaded images to album directory %s", albumDir)
+				}
+			}
+		} else {
+			log.Warn().Msgf("Could not identify album name, no title found on page")
+		}
 	}
 
 	jobChan := make(chan Job)
